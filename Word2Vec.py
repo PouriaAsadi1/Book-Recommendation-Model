@@ -393,7 +393,7 @@ def extract_learned_embeddings(embeddings_df, vocab_df, output_path=None):
         book_embeddings_df.write.mode("overwrite").parquet(output_path)
     return book_embeddings_df
 
-# Step 13: Similarity search using cosine similarity
+# 13: Similarity search using cosine similarity
 def find_similar_books(embeddings_df, book_id, top_k=5):
 
     target_df = embeddings_df.filter(F.col("book_id") == book_id).select(
