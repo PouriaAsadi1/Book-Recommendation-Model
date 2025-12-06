@@ -1,7 +1,6 @@
 # Book Recommendation System
 
 [![Project](https://img.shields.io/badge/project-book--recommender-blue.svg)](https://github.com/PouriaAsadi1/Book-Recommendation-Model)
-[![License](https://img.shields.io/badge/license-MIT-lightgrey.svg)](LICENSE)
 
 A scalable book recommendation system built on the Goodreads dataset. This repository contains preprocessing utilities, two recommendation model approaches (SASRec and Word2Vec-style item embeddings), evaluation scripts, and examples for training and inference.
 
