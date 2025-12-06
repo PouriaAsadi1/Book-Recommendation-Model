@@ -17,12 +17,12 @@ spark = SparkSession.builder \
 
 "Phase 1: Data Preparation"
 
-# Step 1: Load pre-trained Word2Vec embeddings
+# 1: Load pre-trained Word2Vec embeddings
 def load_user_sequences(path):
     sequences_df = spark.read.parquet(path).select("user_id", "book_ids")
     return sequences_df
 
-# Step 2: Build vocabulary by creating Spark-based mappings of book IDs to indices and vice versa
+# 2: Build vocabulary by creating Spark-based mappings of book IDs to indices and vice versa
 def build_vocabulary(sequences_df):
     exploded = sequences_df.select(F.explode("book_ids").alias("book_id")).distinct()
     window_spec = Window.orderBy("book_id")
@@ -30,7 +30,7 @@ def build_vocabulary(sequences_df):
     vocab_size = vocab_df.count()
     return vocab_df, vocab_size
 
-# Step 3: Generate training pairs using Spark DataFrame operations
+# 3: Generate training pairs using Spark DataFrame operations
 def generate_training_pairs(sequences_df, window_size, sequence_col="book_ids"):
     exploded = sequences_df.select(
         "user_id",
@@ -58,7 +58,7 @@ def generate_training_pairs(sequences_df, window_size, sequence_col="book_ids"):
 # 2. computing dot products with output embedddings 
 # 3. applying activation function (sigmoid) 
 
-# Step 4: Initialize embeddings as Spark DataFrames with uniform random values
+# 4: Initialize embeddings as Spark DataFrames with uniform random values
 def initialize_embeddings(vocab_df, embedding_dim):
     limit = 0.5 / embedding_dim
 
@@ -77,13 +77,13 @@ def initialize_embeddings(vocab_df, embedding_dim):
     )
     return embeddings_df
 
-# Step 5: Defining the Skip-Gram with Negative Sampling (SGNS) architecture
+# 5: Defining the Skip-Gram with Negative Sampling (SGNS) architecture
 def sigmoid(column):
     if not isinstance(column, Column):
         raise TypeError("sigmoid expects a Spark Column")
     return F.lit(1.0) / (F.lit(1.0) + F.exp(-column))
 
-# Step 6 & 7: Forward pass and loss computation using Spark DataFrame columns
+# 6 & 7: Forward pass and loss computation using Spark DataFrame columns
 def skip_gram_negative_sampling(pairs_with_vectors_df):
     positive_dot = F.expr(
         "aggregate(zip_with(target_vector, context_vector, (x, y) -> x * y), 0D, (acc, value) -> acc + value)"
@@ -105,7 +105,7 @@ def skip_gram_negative_sampling(pairs_with_vectors_df):
     result_df = result_df.withColumn("loss", -F.log(F.col("positive_score")) - F.col("negative_log_sum"))
     return result_df
 
-# Step 8: Implementing backpropagation using Spark Pandas UDFs to compute gradients: 
+# 8: Implementing backpropagation using Spark Pandas UDFs to compute gradients: 
 # - computing gradients of loss with respect to embeddings
 # - updating both input and output embeddings 
 # - gradient for positive sample: (σ(score) - 1) * embedding
@@ -286,7 +286,7 @@ def prepare_training_pairs(sequences_df, window_size, vocab_df):
     )
     return indexed_sequences_df, training_pairs_df
 
-# Step 9, 10, & 11: Optimization using Stochastic Gradient Descent (SGD), batch processing, and multiple epochs
+# 9, 10, & 11: Optimization using Stochastic Gradient Descent (SGD), batch processing, and multiple epochs
 def train_word2vec(
     sequences_df,
     window_size,
@@ -385,7 +385,7 @@ def train_word2vec(
 
 "Phase 5: Evaluation & Usage"
 
-# Step 12: Extract learned embeddings as a Spark DataFrame and optionally persist
+# 12: Extract learned embeddings as a Spark DataFrame and optionally persist
 def extract_learned_embeddings(embeddings_df, vocab_df, output_path=None):
     book_embeddings_df = embeddings_df.join(vocab_df, on="book_index", how="inner") \
         .select("book_index", "book_id", "input_vector")
