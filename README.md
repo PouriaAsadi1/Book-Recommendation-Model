@@ -95,9 +95,9 @@ The `Data_Preprocessing_Word2Vec.py` Spark job (configurable via the `DATASET_RO
 
 Using the included parquet outputs (`user_sequences/` and `book_metadata_lookup/`), we observe:
 
-- **755,311** user reading sequences (after filtering and trimming).
-- Sequence lengths range from **2 to 200** titles with an average of **51.0** and a median of **29** titles.
-- Approximate unique vocabulary size of **~344k** book IDs after filtering; the trained model embeds **331,434** of them (see results below).
+- 755,311 user reading sequences (after filtering and trimming).
+- Sequence lengths range from 2 to 200 titles with an average of 51.0 and a median of 29 titles.
+- Approximate unique vocabulary size of ~344k book IDs after filtering; the trained model embeds 331,434 of them (see results below).
 - Metadata lookup rows include: `title`, `title_without_series`, `author_names[]`, `top_genres[]`, `average_rating`, `ratings_count`, `publication_year`, `series_ids`, and work-level fields for labeling downstream recommendations.
 
 All artifacts are saved as parquet so Spark-based training/evaluation scripts can load them efficiently.
