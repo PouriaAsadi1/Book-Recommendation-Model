@@ -175,7 +175,7 @@ Top 5 similar books for 132538:
 ```
 
 Additional sampled IDs such as `426023` and `223384` return fantasy and classic-literature neighbors, respectively, with cosine scores ≈0.39–0.44. Interpretation:
-- The embedding summary confirms the model captured **331,434** distinct titles with stable vector norms (no gradient explosion).
+- The embedding summary confirms the model captured 331,434 distinct titles with stable vector norms (no gradient explosion).
 - Top neighbors cluster translations or installments of the same work (e.g., *Life of Pi* variants) as well as frequently co-read classics, showing that trimming + deduplication prevented noisy transitions.
 - Metadata joins allow downstream services to replace integer book IDs with human-readable titles when presenting recommendations.
 
