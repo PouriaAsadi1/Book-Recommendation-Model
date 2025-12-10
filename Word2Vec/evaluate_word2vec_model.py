@@ -139,10 +139,23 @@ def display_similarities(local_embeddings, book_ids: Iterable[str], top_k: int, 
         neighbors = find_similar_local(local_embeddings, book_id, top_k=top_k)
         metadata_ids = [book_id] + [neighbor_id for neighbor_id, _ in neighbors]
         metadata_lookup = fetch_metadata_titles(metadata_df, metadata_ids)
+        if metadata_df is not None and book_id not in metadata_lookup:
+            # Skip printing this book entirely if no metadata match exists.
+            continue
+
+        if metadata_df is not None:
+            neighbors = [
+                (neighbor_id, score)
+                for neighbor_id, score in neighbors
+                if neighbor_id in metadata_lookup
+            ]
         label = format_book_label(book_id, metadata_lookup)
         print(f"Top {top_k} similar books for {label}:")
         if not neighbors:
-            print("  No matches found.")
+            if metadata_df is not None:
+                print("  No metadata-backed matches found.")
+            else:
+                print("  No matches found.")
         else:
             for idx, (neighbor_id, score) in enumerate(neighbors, start=1):
                 neighbor_label = format_book_label(neighbor_id, metadata_lookup)
