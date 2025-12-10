@@ -7,23 +7,52 @@ import pyspark.sql.functions as F
 from pyspark.sql.window import Window
 from pyspark.sql import types as T
 
-# Set up Spark session
+# Set up Spark session with optimized settings for Dataproc clusters
 spark = SparkSession.builder \
     .appName("Word2VecBookRecommendation") \
     .config("spark.driver.memory", "8g") \
-    .config("spark.sql.shuffle.partitions", "200") \
+    .config("spark.sql.shuffle.partitions", "48") \
+    .config("spark.driver.maxResultSize", "2g") \
+    .config("spark.memory.fraction", "0.6") \
+    .config("spark.memory.storageFraction", "0.3") \
+    .config("spark.sql.adaptive.enabled", "true") \
+    .config("spark.sql.adaptive.coalescePartitions.enabled", "true") \
+    .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer") \
     .getOrCreate()
 spark.sparkContext.setCheckpointDir("/tmp/spark-checkpoints")
+
+# Temporary path for breaking lineage - use GCS for Dataproc, local path for testing
+# Change this to a local path when running locally
+LINEAGE_BREAK_PATH = "gs://word2vec_brm/temp/lineage_break"
+# LINEAGE_BREAK_PATH = "/tmp/spark-lineage-break"  # Use for local testing
 
 
 def log_phase_step(phase, step, message):
     print(f"[{phase}][{step}] {message}", flush=True)
 
 
+def break_lineage(df, name="temp"):
+    """
+    Break DataFrame lineage by writing to parquet and reading back.
+    This prevents StackOverflowError from deep lineage chains.
+    """
+    import uuid
+    temp_path = f"{LINEAGE_BREAK_PATH}/{name}_{uuid.uuid4().hex}"
+    df.write.mode("overwrite").parquet(temp_path)
+    result = spark.read.parquet(temp_path)
+    log_phase_step("Lineage", "Break", f"Broke lineage for {name} via {temp_path}")
+    return result
+
+
 GRADIENT_SCHEMA = T.StructType([
     T.StructField("book_index", T.IntegerType(), nullable=False),
     T.StructField("input_gradient", T.ArrayType(T.FloatType()), nullable=True),
     T.StructField("output_gradient", T.ArrayType(T.FloatType()), nullable=True),
+])
+
+PAIR_SCHEMA = T.StructType([
+    T.StructField("target_book_index", T.IntegerType(), nullable=False),
+    T.StructField("context_book_index", T.IntegerType(), nullable=False),
 ])
 
 
@@ -65,6 +94,32 @@ def generate_training_pairs(sequences_df, window_size, sequence_col="book_ids"):
     )
     log_phase_step("Phase 1", "Step 3", f"Generated training pairs using window size {window_size}")
     return pairs_df
+
+
+def _build_sequence_pair_generator(window_size):
+    win = int(window_size)
+
+    def _generate(pdf_iter):
+        for pdf in pdf_iter:
+            for row in pdf.itertuples(index=False):
+                indices = row.book_indices
+                if indices is None:
+                    continue
+                length = len(indices)
+                if length <= 1:
+                    continue
+                rows = []
+                for pos, target_idx in enumerate(indices):
+                    start = max(0, pos - win)
+                    end = min(length, pos + win + 1)
+                    for ctx_pos in range(start, end):
+                        if ctx_pos == pos:
+                            continue
+                        rows.append((int(target_idx), int(indices[ctx_pos])))
+                if rows:
+                    yield pd.DataFrame(rows, columns=["target_book_index", "context_book_index"])
+
+    return _generate
 
 
 "Phase 2 & 3: Model Architecture and Training Components"
@@ -218,33 +273,68 @@ def compute_partition_gradients(pairs_with_vectors_df):
 
 
 def apply_aggregated_updates(aggregated_gradients_df, embeddings_df, learning_rate):
-    updated_embeddings = embeddings_df.alias("emb").join(
-        aggregated_gradients_df.alias("grad"), on="book_index", how="left"
-    )
-
-    updated_embeddings = updated_embeddings.withColumn(
-        "input_vector",
-        F.when(
-            (F.col("input_gradient").isNotNull()) & (F.size("input_gradient") > 0),
-            F.expr(
-                f"zip_with(input_vector, input_gradient, (v, g) -> cast(v - ({learning_rate}) * g as float))"
-            ),
-        ).otherwise(F.col("input_vector")),
-    )
-
-    updated_embeddings = updated_embeddings.withColumn(
-        "output_vector",
-        F.when(
-            (F.col("output_gradient").isNotNull()) & (F.size("output_gradient") > 0),
-            F.expr(
-                f"zip_with(output_vector, output_gradient, (v, g) -> cast(v - ({learning_rate}) * g as float))"
-            ),
-        ).otherwise(F.col("output_vector")),
-    )
-
-    updated_embeddings = updated_embeddings.drop("input_gradient", "output_gradient")
+    """
+    Apply gradient updates by collecting gradients to driver and broadcasting.
+    This avoids deep lineage from joins that cause StackOverflowError.
+    """
+    # Collect gradients to driver (should be manageable - one row per book in vocab)
+    gradient_map = {}
+    for row in aggregated_gradients_df.toLocalIterator():
+        idx = row["book_index"]
+        if idx not in gradient_map:
+            gradient_map[idx] = {"input": None, "output": None}
+        if row["input_gradient"] is not None and len(row["input_gradient"]) > 0:
+            gradient_map[idx]["input"] = list(row["input_gradient"])
+        if row["output_gradient"] is not None and len(row["output_gradient"]) > 0:
+            gradient_map[idx]["output"] = list(row["output_gradient"])
+    
+    log_phase_step("Phase 4", "Gradient Collection", f"Collected gradients for {len(gradient_map)} book indices")
+    
+    # Broadcast gradient map
+    bc_gradients = spark.sparkContext.broadcast(gradient_map)
+    lr = float(learning_rate)
+    
+    def apply_updates_partition(pdf_iter):
+        import numpy as np
+        grads = bc_gradients.value
+        for pdf in pdf_iter:
+            if pdf.empty:
+                yield pdf
+                continue
+            
+            new_input_vectors = []
+            new_output_vectors = []
+            
+            for _, row in pdf.iterrows():
+                idx = row["book_index"]
+                input_vec = np.array(row["input_vector"], dtype=np.float32)
+                output_vec = np.array(row["output_vector"], dtype=np.float32)
+                
+                if idx in grads:
+                    if grads[idx]["input"] is not None:
+                        input_grad = np.array(grads[idx]["input"], dtype=np.float32)
+                        input_vec = input_vec - lr * input_grad
+                    if grads[idx]["output"] is not None:
+                        output_grad = np.array(grads[idx]["output"], dtype=np.float32)
+                        output_vec = output_vec - lr * output_grad
+                
+                new_input_vectors.append(input_vec.tolist())
+                new_output_vectors.append(output_vec.tolist())
+            
+            pdf = pdf.copy()
+            pdf["input_vector"] = new_input_vectors
+            pdf["output_vector"] = new_output_vectors
+            yield pdf
+    
+    updated_schema = T.StructType([
+        T.StructField("book_index", T.IntegerType(), nullable=False),
+        T.StructField("input_vector", T.ArrayType(T.FloatType()), nullable=True),
+        T.StructField("output_vector", T.ArrayType(T.FloatType()), nullable=True),
+    ])
+    
+    updated_embeddings = embeddings_df.mapInPandas(apply_updates_partition, schema=updated_schema)
     log_phase_step("Phase 4", "Partition Updates", "Applied aggregated gradients to embeddings")
-    return updated_embeddings
+    return updated_embeddings, bc_gradients
 
 
 "Phase 4: Training Loop"
@@ -314,12 +404,31 @@ def build_alias_table(probabilities):
 
 def prepare_training_pairs(sequences_df, window_size, vocab_df):
     indexed_sequences_df = map_sequences_to_indices(sequences_df, vocab_df)
-    training_pairs_df = generate_training_pairs(indexed_sequences_df, window_size, sequence_col="book_indices").select(
-        F.col("target_book_id").alias("target_book_index"),
-        F.col("context_book_id").alias("context_book_index")
-    )
-    log_phase_step("Phase 4", "Training Pair Prep", "Prepared indexed sequences and training pairs")
-    return indexed_sequences_df, training_pairs_df
+    log_phase_step("Phase 4", "Training Pair Prep", "Prepared indexed sequences for training")
+    return indexed_sequences_df
+
+
+def generate_epoch_pairs(indexed_sequences_df, window_size, sample_fraction, pair_sample_fraction, max_pairs, epoch_seed):
+    sequences_df = indexed_sequences_df
+    if sample_fraction is not None and sample_fraction < 1.0:
+        sequences_df = sequences_df.sample(withReplacement=False, fraction=sample_fraction, seed=epoch_seed)
+    pair_generator = _build_sequence_pair_generator(window_size)
+    epoch_pairs_df = sequences_df.mapInPandas(pair_generator, schema=PAIR_SCHEMA)
+    if max_pairs is not None:
+        if pair_sample_fraction is not None and pair_sample_fraction < 1.0:
+            epoch_pairs_df = epoch_pairs_df.sample(
+                withReplacement=False,
+                fraction=pair_sample_fraction,
+                seed=epoch_seed + 17,
+            )
+        epoch_pairs_df = epoch_pairs_df.limit(max_pairs)
+    elif pair_sample_fraction is not None and pair_sample_fraction < 1.0:
+        epoch_pairs_df = epoch_pairs_df.sample(
+            withReplacement=False,
+            fraction=pair_sample_fraction,
+            seed=epoch_seed + 17,
+        )
+    return epoch_pairs_df
 
 # Step 9, 10, & 11: Optimization using Stochastic Gradient Descent (SGD), batch processing, and multiple epochs
 def train_word2vec(
@@ -337,20 +446,39 @@ def train_word2vec(
     # Returns the final embeddings DataFrame along with the vocabulary DataFrame.
     vocab_df, vocab_size = build_vocabulary(sequences_df)
     embeddings_df = initialize_embeddings(vocab_df, embedding_dim)
-    embeddings_df = embeddings_df.checkpoint(eager=True)
+    # Break lineage early to prevent StackOverflowError
+    embeddings_df = break_lineage(embeddings_df, "embeddings_init")
+    embeddings_df = embeddings_df.cache()
     embeddings_df.count()
-    indexed_sequences_df, training_pairs_df = prepare_training_pairs(sequences_df, window_size, vocab_df)
-    if training_partitions is None:
-        training_partitions = spark.sparkContext.defaultParallelism
-    training_pairs_df = training_pairs_df \
-        .repartition(training_partitions, "target_book_index") \
-        .withColumn("pair_id", F.monotonically_increasing_id()) \
-        .cache()
+    indexed_sequences_df = prepare_training_pairs(sequences_df, window_size, vocab_df)
+    indexed_sequences_df = indexed_sequences_df.cache()
+    total_sequences = indexed_sequences_df.count()
+    log_phase_step("Phase 4", "Sequence Cache", f"Cached {total_sequences} indexed user sequences")
+
+    def _count_pairs(indices):
+        if indices is None:
+            return 0
+        length = len(indices)
+        if length <= 1:
+            return 0
+        max_offset = min(window_size, length - 1)
+        return int(2 * (max_offset * length - (max_offset * (max_offset + 1) // 2)))
+
+    pair_count_udf = F.udf(_count_pairs, T.LongType())
+    total_training_pairs_row = indexed_sequences_df.select(
+        pair_count_udf(F.col("book_indices")).alias("pair_count")
+    ).agg(F.sum("pair_count").alias("total_pairs")).collect()[0]
+    total_training_pairs = total_training_pairs_row["total_pairs"] if total_training_pairs_row else 0
+    if total_training_pairs is None or total_training_pairs == 0:
+        raise ValueError("No training pairs were generated from the input sequences.")
     log_phase_step(
         "Phase 4",
-        "Partitioning",
-        f"Repartitioned training pairs into {training_partitions} partitions keyed by target_book_index",
+        "Training Pair Count",
+        f"Computed {total_training_pairs} target-context pairs from indexed sequences"
     )
+
+    if training_partitions is None:
+        training_partitions = spark.sparkContext.defaultParallelism
     neg_sampling_probs_df = build_negative_sampling_distribution(indexed_sequences_df, vocab_size)
     index_list = []
     prob_list = []
@@ -381,18 +509,69 @@ def train_word2vec(
             samples.append(idxs[final].tolist())
         return pd.Series(samples)
 
+    if max_pairs_per_epoch is not None:
+        desired_fraction = (max_pairs_per_epoch * 1.5) / float(total_training_pairs)
+        min_fraction = (1.0 / total_sequences) if total_sequences > 0 else 0.0
+        sequence_sample_fraction = min(1.0, max(desired_fraction, min_fraction))
+        if sequence_sample_fraction >= 1.0:
+            log_phase_step(
+                "Phase 4",
+                "Sequence Sampling",
+                "Max pairs per epoch is larger than total pair count; processing all sequences.",
+            )
+        expected_pairs = float(total_training_pairs) * sequence_sample_fraction
+        if expected_pairs > 0:
+            pair_sample_fraction = min(1.0, max_pairs_per_epoch / expected_pairs)
+        else:
+            pair_sample_fraction = 1.0
+    else:
+        sequence_sample_fraction = None
+        pair_sample_fraction = None
+
     for epoch in range(total_epochs):
         log_phase_step("Phase 4", "Epoch", f"Starting epoch {epoch + 1}/{total_epochs}")
         epoch_lr = learning_rate * (1 - epoch / total_epochs)
-        output_vector_map = _collect_output_vectors(embeddings_df)
+        
+        # Collect ALL embeddings to driver and broadcast (avoids join lineage)
+        input_vector_map = {}
+        output_vector_map = {}
+        for row in embeddings_df.toLocalIterator():
+            input_vector_map[row["book_index"]] = list(row["input_vector"])
+            output_vector_map[row["book_index"]] = list(row["output_vector"])
+        
+        bc_input_vectors = spark.sparkContext.broadcast(input_vector_map)
         bc_output_vectors = spark.sparkContext.broadcast(output_vector_map)
+        log_phase_step("Phase 4", "Epoch", f"Broadcasted {len(input_vector_map)} embeddings")
+        
         lookup_negative_vectors_udf = _build_negative_lookup_udf(bc_output_vectors)
 
-        epoch_pairs = training_pairs_df.withColumn("rand_key", F.rand(seed=epoch + 1)) \
+        epoch_pairs = generate_epoch_pairs(
+            indexed_sequences_df,
+            window_size,
+            sequence_sample_fraction,
+            pair_sample_fraction,
+            max_pairs_per_epoch,
+            epoch_seed=epoch + 1,
+        )
+        if sequence_sample_fraction is not None:
+            log_phase_step(
+                "Phase 4",
+                "Epoch Sampling",
+                f"Sampled sequences with fraction {sequence_sample_fraction:.6f} for epoch {epoch + 1}",
+            )
+        if pair_sample_fraction is not None and pair_sample_fraction < 1.0:
+            log_phase_step(
+                "Phase 4",
+                "Pair Sampling",
+                f"Applied pair sampling fraction {pair_sample_fraction:.6f} for epoch {epoch + 1}",
+            )
+
+        epoch_pairs = epoch_pairs \
+            .repartition(training_partitions, "target_book_index") \
+            .withColumn("pair_id", F.monotonically_increasing_id()) \
+            .withColumn("rand_key", F.rand(seed=epoch + 1)) \
             .sortWithinPartitions("rand_key") \
             .drop("rand_key")
-        if max_pairs_per_epoch is not None:
-            epoch_pairs = epoch_pairs.limit(max_pairs_per_epoch)
 
         epoch_pairs = epoch_pairs.withColumn(
             "negative_book_indices", sample_negatives_udf(F.col("pair_id"))
@@ -401,27 +580,44 @@ def train_word2vec(
             lookup_negative_vectors_udf(F.col("negative_book_indices"))
         )
 
-        target_embedding_df = embeddings_df.select(
-            F.col("book_index").alias("target_book_index"),
-            F.col("input_vector").alias("target_vector")
-        )
-        context_embedding_df = embeddings_df.select(
-            F.col("book_index").alias("context_book_index"),
-            F.col("output_vector").alias("context_vector")
-        )
-
+        # Use broadcast lookups instead of joins to avoid deep lineage
+        @pandas_udf("array<float>")
+        def lookup_input_vector(indices):
+            data = bc_input_vectors.value
+            return pd.Series([data.get(idx) for idx in indices])
+        
+        @pandas_udf("array<float>")
+        def lookup_output_vector(indices):
+            data = bc_output_vectors.value
+            return pd.Series([data.get(idx) for idx in indices])
+        
         pairs_with_vectors = epoch_pairs \
-            .join(target_embedding_df, on="target_book_index", how="left") \
-            .join(context_embedding_df, on="context_book_index", how="left")
+            .withColumn("target_vector", lookup_input_vector(F.col("target_book_index"))) \
+            .withColumn("context_vector", lookup_output_vector(F.col("context_book_index")))
+
+        # CRITICAL: Break lineage BEFORE computing gradients
+        # This prevents StackOverflowError when collecting gradient results
+        pairs_with_vectors = break_lineage(pairs_with_vectors, f"pairs_epoch_{epoch}")
 
         partition_gradients = compute_partition_gradients(pairs_with_vectors)
         aggregated_gradients = partition_gradients.groupBy("book_index").agg(
             _sum_vectors_udf(F.col("input_gradient")).alias("input_gradient"),
             _sum_vectors_udf(F.col("output_gradient")).alias("output_gradient"),
         )
-        embeddings_df = apply_aggregated_updates(aggregated_gradients, embeddings_df, epoch_lr)
-        embeddings_df = embeddings_df.checkpoint(eager=True)
+        
+        # Break lineage again before collecting gradients
+        aggregated_gradients = break_lineage(aggregated_gradients, f"gradients_epoch_{epoch}")
+        
+        embeddings_df, bc_gradients = apply_aggregated_updates(aggregated_gradients, embeddings_df, epoch_lr)
+        # Break lineage by writing to parquet and reading back
+        # This prevents StackOverflowError from deep transformation chains
+        old_embeddings = embeddings_df
+        embeddings_df = break_lineage(embeddings_df, f"embeddings_epoch_{epoch}")
+        embeddings_df = embeddings_df.cache()
         embeddings_df.count()
+        old_embeddings.unpersist()
+        bc_gradients.unpersist()
+        bc_input_vectors.unpersist()
         bc_output_vectors.unpersist()
         log_phase_step("Phase 4", "Epoch", f"Finished epoch {epoch + 1}/{total_epochs}")
 
@@ -476,8 +672,8 @@ def find_similar_books(embeddings_df, book_id, top_k=5):
 
 # Example usage: 
 if __name__ == "__main__":
-    # data_path = #"gs://word2vec_brm/user_sequences"
-    data_path = "/Users/pouriaasadi/BigDataAnalytics/Book-Recommendation-Model/user_sequences"
+    data_path = "gs://word2vec_brm/full_dataset/processed_artifacts/user_sequences"
+    # data_path = "/Users/pouriaasadi/BigDataAnalytics/Book-Recommendation-Model/user_sequences"
     sequences_df = load_user_sequences(data_path)
 
     trained_embeddings_df, vocab_df = train_word2vec(
@@ -492,13 +688,13 @@ if __name__ == "__main__":
     save_trained_model(
         trained_embeddings_df,
         vocab_df,
-        # output_dir="gs://word2vec_brm/word2Vec_model"
-        output_dir="/Users/pouriaasadi/BigDataAnalytics/Book-Recommendation-Model/Word2Vec_model"
+        output_dir="gs://word2vec_brm/word2Vec_model"
+        # output_dir="/Users/pouriaasadi/BigDataAnalytics/Book-Recommendation-Model/Word2Vec_model"
     )
 
     book_embeddings_df = extract_learned_embeddings(
         trained_embeddings_df,
         vocab_df,
-        # output_path= "gs://word2vec_brm/results"
-        output_path="/Users/pouriaasadi/BigDataAnalytics/Book-Recommendation-Model/results"
+        output_path= "gs://word2vec_brm/results"
+        # output_path="/Users/pouriaasadi/BigDataAnalytics/Book-Recommendation-Model/results"
     )
