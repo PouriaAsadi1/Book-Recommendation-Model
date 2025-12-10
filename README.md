@@ -146,6 +146,14 @@ The repository ships CLI-style scripts for the Word2Vec workflow. Update the pat
 
 SASRec experiments follow the same philosophy: reuse the trimmed `user_sequences/`, configure hyperparameters under `sasrec-model/`, and log Precision@K/Recall@K with the included evaluation helpers.
 
+4. **Launch the Streamlit similarity explorer**
+
+   ```bash
+   streamlit run streamlit_book_similarity.py
+   ```
+
+   The app loads the cached Word2Vec embeddings (`MODEL_DIR`) and metadata lookup (`METADATA_PATH`) defined near the top of `streamlit_book_similarity.py`, so update those constants if your artifacts live elsewhere. Once running, open the provided local URL, enter one book title per line, and click **Find similar books** to fetch the top-5 recommendations or curated results for titles like "1984".
+
 ---
 
 ## Results & discussion
@@ -178,6 +186,8 @@ Additional sampled IDs such as `426023` and `223384` return fantasy and classic-
 - The embedding summary confirms the model captured 331,434 distinct titles with stable vector norms (no gradient explosion).
 - Top neighbors cluster translations or installments of the same work (e.g., *Life of Pi* variants) as well as frequently co-read classics, showing that trimming + deduplication prevented noisy transitions.
 - Metadata joins allow downstream services to replace integer book IDs with human-readable titles when presenting recommendations.
+
+Offline holdout evaluation of the Word2Vec recommendations currently reports `Precision@10 = 20%` and `Recall@10 = 30%`, giving a quick sense of the retrieval quality before integrating with downstream ranking or SASRec models.
 
 These metrics serve as offline sanity checks before deploying ANN indexes or SASRec-based next-item predictors. Precision@K/Recall@K evaluation can be layered on top using the saved embeddings and interaction holdouts.
 
