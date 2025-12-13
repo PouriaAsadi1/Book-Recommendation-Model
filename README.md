@@ -28,7 +28,7 @@ The goal of this project is to learn latent representations that capture complex
 - SASRec — a Transformer-based sequential recommendation model for next-item prediction.
 - Word2Vec-style item embeddings — learns item-to-item similarity from interaction sequences for similarity-based retrieval and discovery.
 
-This system focuses on reproducible offline evaluation (Precision@K, Recall@K) and is designed to be extensible to hybrid models and online evaluation.
+This system focuses on reproducible offline evaluation (Precision@K, Recall@K, Hit@K, NDCG@K) and is designed to be extensible to hybrid models and online evaluation.
 
 ---
 
@@ -37,9 +37,10 @@ This system focuses on reproducible offline evaluation (Precision@K, Recall@K) a
 - Data preprocessing pipeline for the UCSD Goodreads dataset
 - SASRec implementation (sequential/temporal modeling)
 - Word2Vec-style item embedding training and ANN retrieval support
-- Offline evaluation scripts (Precision@K, Recall@K)
+- Offline evaluation scripts (Precision@K, Recall@K, Hit@K, NDCG@K)
 - Example CLI-style scripts for preprocessing, training, evaluation, and inference
 - Configurable hyperparameters and dataset filters
+- Two Web-UI for both model implementations (Word2Vec, SASRec)
 
 ---
 
@@ -198,8 +199,10 @@ These metrics serve as offline sanity checks before deploying ANN indexes or SAS
 This project focuses on standard offline accuracy metrics:
 - Precision@K — fraction of recommended items in top-K that are relevant.
 - Recall@K — fraction of relevant items captured in top-K recommendations.
+- Hit@K — fraction of times the ground-truth next item exists in the top k items.
+- NDCG@K — how well the anticipated ranking of items matches the optimal ranking taking into account each item's significance.
 
-Other useful metrics to consider (future work): NDCG@K, MAP, diversity, novelty, calibration, and online/business metrics (CTR, retention).
+Other useful metrics to consider (future work): MAP, diversity, novelty, calibration, and online/business metrics (CTR, retention).
 
 ---
 
