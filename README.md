@@ -188,9 +188,11 @@ Additional sampled IDs such as `426023` and `223384` return fantasy and classic-
 - Top neighbors cluster translations or installments of the same work (e.g., *Life of Pi* variants) as well as frequently co-read classics, showing that trimming + deduplication prevented noisy transitions.
 - Metadata joins allow downstream services to replace integer book IDs with human-readable titles when presenting recommendations.
 
-Offline holdout evaluation of the Word2Vec recommendations currently reports `Precision@10 = 20%` and `Recall@10 = 30%`, giving a quick sense of the retrieval quality before integrating with downstream ranking or SASRec models.
+We evaluated Word2Vec using a 20% holdout of each user’s interacted books as ground truth. Word2Vec reached Precision@10 = 0.20 and Recall@10 = 0.30, suggesting modest performance typical of interaction-only embeddings without explicit rating optimization or user-level personalization. Qualitative inspection showed recommendations often shared author, genre, and theme, indicating the embedding space captures co-occurrence structure.
 
-These metrics serve as offline sanity checks before deploying ANN indexes or SASRec-based next-item predictors. Precision@K/Recall@K evaluation can be layered on top using the saved embeddings and interaction holdouts.
+SASRec was evaluated with top-N ranking metrics and achieved Hit@10 = 0.82 and NDCG@10 = 0.59, meaning relevant books were often present in the top 10 and generally ranked highly. Overall, SASRec outperformed Word2Vec, likely because it models reading sequences (recency/position patterns) rather than treating history as order-agnostic; however, more rigorous evaluation is needed to draw stronger conclusions.
+
+These metrics serve as offline sanity checks before deploying ANN indexes or further SASRec-based next-item predictors. Precision@K/Recall@K evaluation can be layered on top using the saved embeddings and interaction holdouts.
 
 ---
 
