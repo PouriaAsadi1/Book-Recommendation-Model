@@ -41,6 +41,10 @@ This system focuses on reproducible offline evaluation (Precision@K, Recall@K, H
 - Example CLI-style scripts for preprocessing, training, evaluation, and inference
 - Configurable hyperparameters and dataset filters
 - Two Web-UI for both model implementations (Word2Vec, SASRec)
+- Uses a Transformer-based architecture (Self-Attention) to capture long-term dependencies and reading order.
+- Implements Causal Masking, Positional Embeddings, and Multi-Head Attention from scratch.
+- Optimized training pipeline using Automatic Mixed Precision (AMP) for NVIDIA RTX GPUs.
+- Low-latency prediction engine capable of handling real-time requests.
 
 ---
 
@@ -55,19 +59,22 @@ These are the exact versions and dependencies used for the latest experiments.
 | Apache Spark / PySpark | 3.5.6 | Installed through `pip install pyspark==3.5.6` |
 | Pandas | 2.1.4 | Used in pandas UDFs |
 | NumPy | 1.26.4 | Used for gradient math and evaluation |
+| Nvidia CUDA | >= 13.0 | Used for Hardware Acceleration |
+| PyTorch | >= 2.9.1 | Built Deep Neural Networks |
 
 ### Local environment steps
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install pyspark==3.5.6 pandas==2.1.4 numpy==1.26.4 pyarrow==15.0.2
+pip install pyspark==3.5.6 pandas==2.1.4 numpy==1.26.4 pyarrow==15.0.2 torch numpy pandas tqdm multipart
 ```
 
 Additional requirements:
 - A JDK (11+) on `PATH` so that PySpark can spin up a JVM.
 - Access to the [UCSD Goodreads dataset](https://sites.google.com/eng.ucsd.edu/ucsdbookgraph/home) stored locally or in a bucket (GCS/S3/HDFS). Update the `DATASET_ROOT` constant in `Data_Preprocessing_Word2Vec.py` to point at your copy.
 - Adequate disk and memory. Processing the trimmed dataset still touches ~755k user histories and ~330k book tokens, so we recommend at least `spark.driver.memory=8g`.
+- Dedicate Nvidia GPU is required to run the SASRec model. Depends on the model, the training speed and inference speed may varies.
 
 ---
 
@@ -102,6 +109,18 @@ Using the included parquet outputs (`user_sequences/` and `book_metadata_lookup/
 - Metadata lookup rows include: `title`, `title_without_series`, `author_names[]`, `top_genres[]`, `average_rating`, `ratings_count`, `publication_year`, `series_ids`, and work-level fields for labeling downstream recommendations.
 
 All artifacts are saved as parquet so Spark-based training/evaluation scripts can load them efficiently.
+
+The `./sasrec-model/preprocess.py` file is used to perform data preprocessing for the SASRec model:
+1. **Ingestion**: We load the massive JSON file but only keep the fields necessary for sequential logic (user_id, book_id, and read_at).
+2. **K-Core Filtering**: We iteratively remove users who have read fewer than 5 books and books that have been read by fewer than 5 users. This removes "noise" and ensures the model learns robust patterns.
+3. **Integer Mapping**: The model cannot process raw string IDs (e.g., "12345"). We create a dictionary item2id to map every unique book to a continuous integer (e.g., 1, 2, 3...).
+4. **Sequence Formatting**:
+   - Sort: Crucial for sequential recommendation; we sort by time.
+   - Pad/Truncate: We enforce a fixed length of 50. If a user read 100 books, we only keep the most recent 50. If they read 10, we add 40 zeros to the start.
+5. **Leave-One-Out Splitting**:
+   - Train: All books except the last two.
+   - Validation: The second to last book (used to tune hyperparameters).
+   - Test: The very last book (used to calculate Hit@10 and NDCG@10).
 
 ---
 
@@ -156,6 +175,32 @@ SASRec experiments follow the same philosophy: reuse the trimmed `user_sequences
    The app loads the cached Word2Vec embeddings (`MODEL_DIR`) and metadata lookup (`METADATA_PATH`) defined near the top of `streamlit_book_similarity.py`, so update those constants if your artifacts live elsewhere. Once running, open the provided local URL, enter one book title per line, and click **Find similar books** to fetch the top-5 recommendations or curated results for titles like "1984".
 
 ---
+
+Note: For GPU acceleration, ensure your PyTorch installation matches your CUDA version.
+
+1. **Run Processing:**
+   ```bash
+   python preprocess.py
+   ```
+
+   - **Action**: Filters users/books (k-core), maps string IDs to integers, and generates interaction sequence.
+   - **Output**: Create a file named `dataset.pkl`.
+
+2. **Model Training**
+   ```bash
+   python train.py
+   ```
+
+   - Configuration: You can modify hyperparameters (Batch Size, Epochs, Embedding Dim) directly in the train.py header.
+   - Process: The script will automatically detect if a GPU (e.g., RTX 4070 Ti) is available and use Automatic Mixed Precision (AMP) for faster training.
+   - Output: Saves the best model weights to sasrec_epoch_20.pth (or similar).
+
+3. **Inference & Evaluation**
+   ```bash
+   inference.py
+   ```
+
+   - **Action**: Runs the model.
 
 ## Results & discussion
 
